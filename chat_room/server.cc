@@ -5,7 +5,94 @@
 
 #include <argparse/argparse.hpp>
 #include <iostream>
+#include <set>
+#include <shared_mutex>
 #include <string>
+#include <thread>
+
+#include "message.h"
+
+class ClientsPool {
+ private:
+  std::mutex mtx_;
+  std::set<int> client_fds_;
+
+ public:
+  void Add(int fd) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    LOG(INFO) << "fd " << fd << " is added";
+    client_fds_.insert(fd);
+  }
+  void Remove(int fd) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    LOG(INFO) << "fd " << fd << " is removed";
+    client_fds_.erase(fd);
+  }
+  std::set<int> client_fds() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    return client_fds_;
+  }
+};
+
+class MessageQueue {
+ private:
+  std::shared_mutex mtx_;
+  std::vector<std::string> queue_;
+
+ public:
+  void Push(const std::string& message) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    queue_.push_back(message);
+    const Message* ptr = reinterpret_cast<const Message*>(&message[0]);
+    LOG(INFO) << ptr->name() << ": \"" << ptr->text() << "\"\n";
+  }
+  int Size() {
+    std::shared_lock<std::shared_mutex> lock(mtx_);
+    return queue_.size();
+  }
+};
+
+ClientsPool clients_pool;
+MessageQueue message_queue;
+
+void RecvLoop(int client_fd) {
+  while (1) {
+    char header_buf[sizeof(Message::Header)];
+    int offset = 0;
+    while (offset < sizeof(header_buf)) {
+      int size =
+          recv(client_fd, &header_buf + offset, sizeof(header_buf) - offset, 0);
+      if (size == 0) {
+        // client is closed
+        clients_pool.Remove(client_fd);
+        close(client_fd);
+        return;
+      }
+      offset += size;
+    }
+
+    Message::Header* header = reinterpret_cast<Message::Header*>(header_buf);
+
+    int message_len = sizeof(Message::Header) + header->payload_len();
+
+    std::string message_buf(message_len, 0);
+    std::copy(header_buf, header_buf + sizeof(header_buf), &message_buf[0]);
+    offset = sizeof(Message::Header);
+
+    while (offset < message_len) {
+      int size =
+          recv(client_fd, &message_buf[0] + offset, message_len - offset, 0);
+      if (size == 0) {
+        clients_pool.Remove(client_fd);
+        close(client_fd);
+        return;
+      }
+      offset += size;
+    }
+
+    message_queue.Push(message_buf);
+  }
+}
 
 int main(int argc, char* argv[]) {
   argparse::ArgumentParser program("Chat Room Server");
@@ -26,9 +113,22 @@ int main(int argc, char* argv[]) {
   getaddrinfo(nullptr, std::to_string(program.get<int>("--port")).c_str(),
               &hints, &res);
   int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  CHECK_GE(fd, 0) << "fail to initialize socket";
+  CHECK_GE(fd, 0);
   CHECK_EQ(bind(fd, res->ai_addr, res->ai_addrlen), 0);
   freeaddrinfo(res);
+
+  CHECK_EQ(listen(fd, 20), 0);
+
+  while (1) {
+    sockaddr client_addr;
+    socklen_t client_addr_size = sizeof(sockaddr);
+    int client_fd = accept(fd, &client_addr, &client_addr_size);
+    CHECK_GE(client_fd, 0);
+
+    clients_pool.Add(client_fd);
+
+    std::thread(RecvLoop, client_fd).detach();
+  }
 
   return 0;
 }

@@ -12,3 +12,12 @@ target_link_libraries(
     glog
     argparse
 )
+add_executable(
+    chat_room_client
+    "chat_room/client.cc"
+)
+target_link_libraries(
+    chat_room_client
+    glog
+    argparse
+)
