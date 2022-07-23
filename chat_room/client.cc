@@ -5,8 +5,49 @@
 
 #include <argparse/argparse.hpp>
 #include <iostream>
+#include <thread>
 
 #include "message.h"
+
+void RecvLoop(int server_fd) {
+  while (1) {
+    char header_buf[sizeof(Message::Header)];
+    int offset = 0;
+    while (offset < sizeof(header_buf)) {
+      int size =
+          recv(server_fd, &header_buf + offset, sizeof(header_buf) - offset, 0);
+      if (size == 0) {
+        // server is closed
+        close(server_fd);
+        return;
+      }
+      offset += size;
+    }
+
+    Message::Header* header = reinterpret_cast<Message::Header*>(header_buf);
+
+    int message_len = sizeof(Message::Header) + header->payload_len();
+
+    std::string message_buf(message_len, 0);
+    std::copy(header_buf, header_buf + sizeof(header_buf), &message_buf[0]);
+    offset = sizeof(Message::Header);
+
+    while (offset < message_len) {
+      int size =
+          recv(server_fd, &message_buf[0] + offset, message_len - offset, 0);
+      if (size == 0) {
+        // server is closed
+        close(server_fd);
+        return;
+      }
+      offset += size;
+    }
+
+    Message* message = reinterpret_cast<Message*>(&message_buf[0]);
+    std::cout << message->name() << ": \"" << message->text() << "\"\n"
+              << std::flush;
+  }
+}
 
 int main(int argc, char* argv[]) {
   argparse::ArgumentParser program("Chat Room Client");
@@ -32,6 +73,8 @@ int main(int argc, char* argv[]) {
   CHECK_GE(fd, 0);
   CHECK_EQ(connect(fd, res->ai_addr, res->ai_addrlen), 0);
   freeaddrinfo(res);
+
+  std::thread(RecvLoop, fd).detach();
 
   std::string text;
   while (std::getline(std::cin, text)) {
